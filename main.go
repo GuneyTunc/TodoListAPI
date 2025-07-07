@@ -94,7 +94,7 @@ func createTables() {
 		CONSTRAINT FK_TodoList FOREIGN KEY (list_id) REFERENCES todolists (id) ON DELETE CASCADE
 	);`
 
-	// Transaction içinde çalıştırmak, birden fazla DDL komutunu atomik hale getirmenin iyi bir yoludur.
+	// Transaction başlatılır
 	tx, err := db.Begin()
 	if err != nil {
 		panic(fmt.Sprintf("Transaction başlatılamadı: %v", err))
