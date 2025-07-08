@@ -3,10 +3,13 @@ package main
 import (
 	"database/sql"
 	"fmt"
+	"log" // log paketi eklendi
 	"net/http"
+	"os" // os paketi eklendi
 	"strconv"
 
 	mssql "github.com/denisenkom/go-mssqldb"
+	"github.com/joho/godotenv" // godotenv kütüphanesi eklendi
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
 )
@@ -29,9 +32,28 @@ type TodoList struct {
 var db *sql.DB
 
 func main() {
-	var err error
 
-	connString := "server=127.0.0.1;database=TodoAppDB;integrated security=true"
+	err := godotenv.Load()
+	if err != nil {
+		log.Fatalf("Error loading .env file: %v", err)
+	}
+
+	// .env dosyasından bağlantı bilgilerini al
+	dbServer := os.Getenv("DB_SERVER")
+	dbName := os.Getenv("DB_NAME")
+	dbIntegratedSecurity := os.Getenv("DB_INTEGRATED_SECURITY")
+	appPort := os.Getenv("APP_PORT")
+
+	connString := fmt.Sprintf("server=%s;database=%s;", dbServer, dbName)
+
+	if dbIntegratedSecurity == "true" {
+		connString += "integrated security=true"
+	} /*else {
+		// Kullanıcı adı ve şifre varsa ekle
+		if dbUser != "" && dbPassword != "" {
+			connString += fmt.Sprintf("user id=%s;password=%s;", dbUser, dbPassword)
+		}
+	}*/
 
 	db, err = sql.Open("sqlserver", connString)
 	if err != nil {
@@ -68,8 +90,8 @@ func main() {
 	e.PUT("/todolists/:listID/todos/:todoID", updateTodoInList)
 	e.DELETE("/todolists/:listID/todos/:todoID", deleteTodoInList)
 
-	fmt.Println("Sunucu 8080 portunda dinliyor...")
-	e.Logger.Fatal(e.Start(":8080"))
+	fmt.Printf("Sunucu %s portunda dinliyor...\n", appPort)
+	e.Logger.Fatal(e.Start(":" + appPort))
 }
 
 // createTables veritabanı tablolarını oluşturur (eğer yoksa).
@@ -94,7 +116,7 @@ func createTables() {
 		CONSTRAINT FK_TodoList FOREIGN KEY (list_id) REFERENCES todolists (id) ON DELETE CASCADE
 	);`
 
-	// Transaction içinde çalıştırmak, birden fazla DDL komutunu atomik hale getirmenin iyi bir yoludur.
+	// Transaction başlatılır
 	tx, err := db.Begin()
 	if err != nil {
 		panic(fmt.Sprintf("Transaction başlatılamadı: %v", err))
@@ -117,8 +139,6 @@ func createTables() {
 	}
 	fmt.Println("Veritabanı tabloları başarıyla oluşturuldu veya zaten mevcut.")
 }
-
-// -- TodoList Handler Fonksiyonları --
 
 func createTodoList(c echo.Context) error {
 	todoList := new(TodoList)
