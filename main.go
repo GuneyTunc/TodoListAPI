@@ -1,22 +1,35 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
-	"log" // log paketi eklendi
+	"log"
 	"net/http"
-	"os" // os paketi eklendi
 	"strconv"
+	"time"
 
 	mssql "github.com/denisenkom/go-mssqldb"
-	"github.com/joho/godotenv" // godotenv kütüphanesi eklendi
+	"github.com/kelseyhightower/envconfig"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
+	openai "github.com/sashabaranov/go-openai"
 )
+
+// Config holds application configuration.
+type Config struct {
+	DbServer             string `envconfig:"DB_SERVER" required:"true"`
+	DbName               string `envconfig:"DB_NAME"   required:"true"`
+	DbIntegratedSecurity bool   `envconfig:"DB_INTEGRATED_SECURITY" default:"false"`
+	DbUser               string `envconfig:"DB_USER"`
+	DbPassword           string `envconfig:"DB_PASSWORD"`
+	AppPort              string `envconfig:"APP_PORT"  default:"8080"`
+	OpenAIApiKey         string `envconfig:"OPENAI_API_KEY" required:"true"`
+}
 
 type Todo struct {
 	ID          int    `json:"id"`
-	ListID      int    `json:"listId"`
+	ListID      int    `json:"listId"` // 'list_id' yerine 'ListID' olarak düzeltildi (JSON tag'i)
 	Title       string `json:"title"`
 	Description string `json:"description"`
 	Completed   bool   `json:"completed"`
@@ -28,116 +41,82 @@ type TodoList struct {
 	Todos []Todo `json:"todos,omitempty"`
 }
 
-// Global veritabanı bağlantı nesnesi
 var db *sql.DB
+var openaiClient *openai.Client
 
 func main() {
-
-	err := godotenv.Load()
+	var cfg Config
+	// `envconfig` kütüphanesi, Docker Compose tarafından yüklenen
+	// ortam değişkenlerini doğrudan okuyacaktır.
+	err := envconfig.Process("", &cfg)
 	if err != nil {
-		log.Fatalf("Error loading .env file: %v", err)
+		log.Fatalf("Error processing environment variables: %v", err)
 	}
 
-	// .env dosyasından bağlantı bilgilerini al
-	dbServer := os.Getenv("DB_SERVER")
-	dbName := os.Getenv("DB_NAME")
-	dbIntegratedSecurity := os.Getenv("DB_INTEGRATED_SECURITY")
-	appPort := os.Getenv("APP_PORT")
+	openaiClient = openai.NewClient(cfg.OpenAIApiKey)
 
-	connString := fmt.Sprintf("server=%s;database=%s;", dbServer, dbName)
+	connString := fmt.Sprintf("server=%s;database=%s;", cfg.DbServer, cfg.DbName)
 
-	if dbIntegratedSecurity == "true" {
-		connString += "integrated security=true"
-	} /*else {
-		// Kullanıcı adı ve şifre varsa ekle
-		if dbUser != "" && dbPassword != "" {
-			connString += fmt.Sprintf("user id=%s;password=%s;", dbUser, dbPassword)
+	if cfg.DbIntegratedSecurity {
+		connString += "integrated security=true;"
+	} else {
+		if cfg.DbUser != "" && cfg.DbPassword != "" {
+			connString += fmt.Sprintf("user id=%s;password=%s;", cfg.DbUser, cfg.DbPassword)
+		} else {
+			log.Fatalf("Error: DB_USER and DB_PASSWORD are required when DB_INTEGRATED_SECURITY is false.")
 		}
-	}*/
-
-	db, err = sql.Open("sqlserver", connString)
-	if err != nil {
-		panic(fmt.Sprintf("Veritabanına bağlanılamadı: %v", err))
 	}
-	defer db.Close() // Uygulama kapanırken veritabanı bağlantısını kapat
 
-	// Veritabanı bağlantısının açık olup olmadığını test et
-	err = db.Ping()
-	if err != nil {
-		panic(fmt.Sprintf("Veritabanı bağlantısı testi başarısız: %v", err))
+	maxRetries := 10
+	retryInterval := 5 * time.Second
+
+	for i := 0; i < maxRetries; i++ {
+		log.Printf("Attempting to connect to database (Attempt %d/%d)...", i+1, maxRetries)
+		db, err = sql.Open("sqlserver", connString)
+		if err != nil {
+			log.Printf("Error opening database connection: %v. Retrying in %s...", err, retryInterval)
+			time.Sleep(retryInterval)
+			continue
+		}
+
+		err = db.Ping()
+		if err != nil {
+			db.Close()
+			log.Printf("Database connection test failed: %v. Retrying in %s...", err, retryInterval)
+			time.Sleep(retryInterval)
+			continue
+		}
+
+		fmt.Println("SQL Server database connection successful!")
+		break
 	}
-	fmt.Println("SQL Server veritabanı bağlantısı başarılı!")
 
-	// Tabloları oluştur (eğer yoksa)
-	createTables()
+	if db == nil || db.Ping() != nil {
+		log.Fatalf("Failed to connect to database after %d retries. Exiting.", maxRetries)
+	}
+	defer db.Close()
 
 	e := echo.New()
 
 	e.Use(middleware.Logger())
 	e.Use(middleware.Recover())
 
-	// TodoList rotaları
 	e.POST("/todolists", createTodoList)
 	e.GET("/todolists", getTodoLists)
 	e.GET("/todolists/:id", getTodoListByID)
 	e.PUT("/todolists/:id", updateTodoList)
 	e.DELETE("/todolists/:id", deleteTodoList)
 
-	// Belirli bir TodoList içindeki Todo rotaları
 	e.POST("/todolists/:listID/todos", createTodoInList)
 	e.GET("/todolists/:listID/todos", getTodosInList)
 	e.GET("/todolists/:listID/todos/:todoID", getTodoInListByID)
 	e.PUT("/todolists/:listID/todos/:todoID", updateTodoInList)
 	e.DELETE("/todolists/:listID/todos/:todoID", deleteTodoInList)
 
-	fmt.Printf("Sunucu %s portunda dinliyor...\n", appPort)
-	e.Logger.Fatal(e.Start(":" + appPort))
-}
+	e.POST("/todos/suggest-description", suggestTodoDescription)
 
-// createTables veritabanı tablolarını oluşturur (eğer yoksa).
-func createTables() {
-	// SQL Server için ID alanını IDENTITY(1,1) olarak ayarla
-	// BOOLEAN yerine BIT kullan
-	createTodoListsTableSQL := `
-	IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='todolists' and xtype='U')
-	CREATE TABLE todolists (
-		id INT IDENTITY(1,1) PRIMARY KEY,
-		title NVARCHAR(255) NOT NULL UNIQUE
-	);`
-
-	createTodosTableSQL := `
-	IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='todos' and xtype='U')
-	CREATE TABLE todos (
-		id INT IDENTITY(1,1) PRIMARY KEY,
-		list_id INT NOT NULL,
-		title NVARCHAR(255) NOT NULL,
-		description NVARCHAR(MAX),
-		completed BIT NOT NULL DEFAULT 0,
-		CONSTRAINT FK_TodoList FOREIGN KEY (list_id) REFERENCES todolists (id) ON DELETE CASCADE
-	);`
-
-	// Transaction başlatılır
-	tx, err := db.Begin()
-	if err != nil {
-		panic(fmt.Sprintf("Transaction başlatılamadı: %v", err))
-	}
-	defer tx.Rollback() // Hata durumunda rollback
-
-	_, err = tx.Exec(createTodoListsTableSQL)
-	if err != nil {
-		panic(fmt.Sprintf("todolists tablosu oluşturulurken hata: %v", err))
-	}
-
-	_, err = tx.Exec(createTodosTableSQL)
-	if err != nil {
-		panic(fmt.Sprintf("todos tablosu oluşturulurken hata: %v", err))
-	}
-
-	err = tx.Commit() // İşlem başarılıysa commit et
-	if err != nil {
-		panic(fmt.Sprintf("Transaction commit edilirken hata: %v", err))
-	}
-	fmt.Println("Veritabanı tabloları başarıyla oluşturuldu veya zaten mevcut.")
+	fmt.Printf("Server %s port is listening...\n", cfg.AppPort)
+	e.Logger.Fatal(e.Start(":" + cfg.AppPort))
 }
 
 func createTodoList(c echo.Context) error {
@@ -150,12 +129,12 @@ func createTodoList(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusBadRequest, "Title for todo list is required")
 	}
 
-	// SQL Server'da IDENTITY değeri almak için INSERT INTO ... OUTPUT INSERTED.ID kullanılır
 	var lastInsertID int
-	err := db.QueryRow("INSERT INTO todolists (title) OUTPUT INSERTED.id VALUES (@p1)", todoList.Title).Scan(&lastInsertID)
+	// DİKKAT: Tablo adı 'TodoLists' olarak düzeltildi
+	err := db.QueryRow("INSERT INTO TodoLists (Title) OUTPUT INSERTED.ID VALUES (@p1)", todoList.Title).Scan(&lastInsertID)
 	if err != nil {
 		if sqlErr, ok := err.(*mssql.Error); ok {
-			if sqlErr.Number == 2627 || sqlErr.Number == 2601 { // SQL Server duplicate key error codes
+			if sqlErr.Number == 2627 || sqlErr.Number == 2601 {
 				return echo.NewHTTPError(http.StatusConflict, "A todo list with this title already exists")
 			}
 		}
@@ -163,13 +142,14 @@ func createTodoList(c echo.Context) error {
 	}
 
 	todoList.ID = lastInsertID
-	todoList.Todos = []Todo{} // Yeni liste oluşturulduğunda görevleri boş döndür
+	todoList.Todos = []Todo{}
 
 	return c.JSON(http.StatusCreated, todoList)
 }
 
 func getTodoLists(c echo.Context) error {
-	rows, err := db.Query("SELECT id, title FROM todolists")
+	// DİKKAT: Tablo adı 'TodoLists' olarak düzeltildi
+	rows, err := db.Query("SELECT ID, Title FROM TodoLists")
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, fmt.Sprintf("Failed to get todo lists: %v", err))
 	}
@@ -194,7 +174,8 @@ func getTodoListByID(c echo.Context) error {
 	}
 
 	var todoList TodoList
-	err = db.QueryRow("SELECT id, title FROM todolists WHERE id = @p1", id).Scan(&todoList.ID, &todoList.Title)
+	// DİKKAT: Tablo adı 'TodoLists' olarak düzeltildi
+	err = db.QueryRow("SELECT ID, Title FROM TodoLists WHERE ID = @p1", id).Scan(&todoList.ID, &todoList.Title)
 	if err == sql.ErrNoRows {
 		return echo.NewHTTPError(http.StatusNotFound, "To-Do list not found")
 	}
@@ -202,7 +183,6 @@ func getTodoListByID(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusInternalServerError, fmt.Sprintf("Failed to get todo list: %v", err))
 	}
 
-	// Listeye ait görevleri de çek
 	todosInList, err := getTodosForList(todoList.ID)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, fmt.Sprintf("Failed to get todos for list: %v", err))
@@ -227,10 +207,9 @@ func updateTodoList(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusBadRequest, "Title for todo list is required")
 	}
 
-	// Veritabanında listeyi güncelle
-	res, err := db.Exec("UPDATE todolists SET title = @p1 WHERE id = @p2", updatedTodoList.Title, id)
+	// DİKKAT: Tablo adı 'TodoLists' olarak düzeltildi
+	res, err := db.Exec("UPDATE TodoLists SET Title = @p1 WHERE ID = @p2", updatedTodoList.Title, id)
 	if err != nil {
-		// SQL Server'daki UNIQUE kısıtlama hatası mesajı veya kodu kontrolü gerekebilir.
 		return echo.NewHTTPError(http.StatusInternalServerError, fmt.Sprintf("Failed to update todo list: %v", err))
 	}
 
@@ -252,7 +231,8 @@ func deleteTodoList(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusBadRequest, "Invalid ID format")
 	}
 
-	res, err := db.Exec("DELETE FROM todolists WHERE id = @p1", id)
+	// DİKKAT: Tablo adı 'TodoLists' olarak düzeltildi
+	res, err := db.Exec("DELETE FROM TodoLists WHERE ID = @p1", id)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, fmt.Sprintf("Failed to delete todo list: %v", err))
 	}
@@ -268,7 +248,7 @@ func deleteTodoList(c echo.Context) error {
 	return c.NoContent(http.StatusNoContent)
 }
 
-// -- Todo (Görev) Handler Fonksiyonları --
+// --- To-Do (Task) Handler Functions ---
 
 func createTodoInList(c echo.Context) error {
 	listID, err := strconv.Atoi(c.Param("listID"))
@@ -281,13 +261,15 @@ func createTodoInList(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusBadRequest, "Invalid request body")
 	}
 
+	log.Printf("Received new task request: Title='%s', Description='%s'", newTodo.Title, newTodo.Description)
+
 	if newTodo.Title == "" {
 		return echo.NewHTTPError(http.StatusBadRequest, "Todo title is required")
 	}
 
-	// Önce listenin varlığını kontrol et
-	var exists int // SQL Server'da EXISTS 1 veya 0 döndürür, BIT tipi int olarak taranabilir
-	err = db.QueryRow("SELECT IIF(EXISTS(SELECT 1 FROM todolists WHERE id = @p1), 1, 0)", listID).Scan(&exists)
+	var exists int
+	// DİKKAT: Tablo adı 'TodoLists' olarak düzeltildi
+	err = db.QueryRow("SELECT IIF(EXISTS(SELECT 1 FROM TodoLists WHERE ID = @p1), 1, 0)", listID).Scan(&exists)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, fmt.Sprintf("Failed to check list existence: %v", err))
 	}
@@ -295,17 +277,28 @@ func createTodoInList(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusNotFound, "To-Do list not found")
 	}
 
-	// Veritabanına yeni görev ekle
-	// SQL Server'da BOOLEAN yerine BIT kullanıldığı için, Go'daki bool'u int'e dönüştürmemiz gerekebilir.
-	// go-mssqldb sürücüsü genellikle bool'u BIT'e otomatik dönüştürür, ancak emin olmak için:
+	if newTodo.Description == "" {
+		log.Println("Description is empty, attempting to generate with AI.")
+		suggestedDesc, err := generateDescriptionWithOpenAI(newTodo.Title)
+		if err != nil {
+			log.Printf("Failed to generate description with OpenAI: %v", err)
+		} else {
+			newTodo.Description = suggestedDesc
+			log.Printf("AI generated description: '%s'", newTodo.Description)
+		}
+	} else {
+		log.Println("Description provided in request, skipping AI generation.")
+	}
+
 	completedBit := 0
 	if newTodo.Completed {
 		completedBit = 1
 	}
 
 	var lastInsertID int
+	// DİKKAT: Tablo adı 'Todos' ve sütun adı 'ListID' olarak düzeltildi
 	err = db.QueryRow(
-		"INSERT INTO todos (list_id, title, description, completed) OUTPUT INSERTED.id VALUES (@p1, @p2, @p3, @p4)",
+		"INSERT INTO Todos (ListID, Title, Description, Completed) OUTPUT INSERTED.ID VALUES (@p1, @p2, @p3, @p4)",
 		listID, newTodo.Title, newTodo.Description, completedBit,
 	).Scan(&lastInsertID)
 	if err != nil {
@@ -313,11 +306,12 @@ func createTodoInList(c echo.Context) error {
 	}
 
 	newTodo.ID = lastInsertID
-	newTodo.ListID = listID // Atanan list ID'sini de nesneye ekle
+	newTodo.ListID = listID
 
 	return c.JSON(http.StatusCreated, newTodo)
 }
 
+// getTodosInList retrieves all todos for a specific list.
 func getTodosInList(c echo.Context) error {
 	listID, err := strconv.Atoi(c.Param("listID"))
 	if err != nil {
@@ -326,7 +320,6 @@ func getTodosInList(c echo.Context) error {
 
 	todosInList, err := getTodosForList(listID)
 	if err != nil {
-		// getTodosForList zaten NotFound hatasını döndürebilir, burada kontrol edelim
 		if err.Error() == "To-Do list not found" {
 			return echo.NewHTTPError(http.StatusNotFound, "To-Do list not found")
 		}
@@ -336,11 +329,11 @@ func getTodosInList(c echo.Context) error {
 	return c.JSON(http.StatusOK, todosInList)
 }
 
-// getTodosForList, belirli bir listeye ait tüm görevleri veritabanından çeken yardımcı bir fonksiyondur.
+// getTodosForList, a helper function to get all todos for a specific list from database
 func getTodosForList(listID int) ([]Todo, error) {
-	// Önce listenin varlığını kontrol et
 	var listExists int
-	err := db.QueryRow("SELECT IIF(EXISTS(SELECT 1 FROM todolists WHERE id = @p1), 1, 0)", listID).Scan(&listExists)
+	// DİKKAT: Tablo adı 'TodoLists' olarak düzeltildi
+	err := db.QueryRow("SELECT IIF(EXISTS(SELECT 1 FROM TodoLists WHERE ID = @p1), 1, 0)", listID).Scan(&listExists)
 	if err != nil {
 		return nil, fmt.Errorf("failed to check list existence: %w", err)
 	}
@@ -348,8 +341,8 @@ func getTodosForList(listID int) ([]Todo, error) {
 		return nil, fmt.Errorf("To-Do list not found")
 	}
 
-	// SQL Server'da BIT kolonunu Go'da bool'a tarama
-	rows, err := db.Query("SELECT id, list_id, title, description, completed FROM todos WHERE list_id = @p1", listID)
+	// DİKKAT: Tablo adı 'Todos' ve sütun adı 'ListID' olarak düzeltildi
+	rows, err := db.Query("SELECT ID, ListID, Title, Description, Completed FROM Todos WHERE ListID = @p1", listID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get todos from database: %w", err)
 	}
@@ -358,8 +351,7 @@ func getTodosForList(listID int) ([]Todo, error) {
 	var todos []Todo
 	for rows.Next() {
 		var todo Todo
-		// completedBit'i kaldırın, doğrudan todo.Completed'a tarayın
-		if err := rows.Scan(&todo.ID, &todo.ListID, &todo.Title, &todo.Description, &todo.Completed); err != nil { // Değişiklik burada
+		if err := rows.Scan(&todo.ID, &todo.ListID, &todo.Title, &todo.Description, &todo.Completed); err != nil {
 			return nil, fmt.Errorf("failed to scan todo: %w", err)
 		}
 		todos = append(todos, todo)
@@ -378,12 +370,13 @@ func getTodoInListByID(c echo.Context) error {
 	}
 
 	var todo Todo
-	// completedBit'i kaldırın, doğrudan todo.Completed'a tarayın
-	err = db.QueryRow("SELECT id, list_id, title, description, completed FROM todos WHERE list_id = @p1 AND id = @p2", listID, todoID).
-		Scan(&todo.ID, &todo.ListID, &todo.Title, &todo.Description, &todo.Completed) // Değişiklik burada
+	// DİKKAT: Tablo adı 'Todos' ve sütun adı 'ListID' olarak düzeltildi
+	err = db.QueryRow("SELECT ID, ListID, Title, Description, Completed FROM Todos WHERE ListID = @p1 AND ID = @p2", listID, todoID).
+		Scan(&todo.ID, &todo.ListID, &todo.Title, &todo.Description, &todo.Completed)
 	if err == sql.ErrNoRows {
 		var listExists int
-		err = db.QueryRow("SELECT IIF(EXISTS(SELECT 1 FROM todolists WHERE id = @p1), 1, 0)", listID).Scan(&listExists)
+		// DİKKAT: Tablo adı 'TodoLists' olarak düzeltildi
+		err = db.QueryRow("SELECT IIF(EXISTS(SELECT 1 FROM TodoLists WHERE ID = @p1), 1, 0)", listID).Scan(&listExists)
 		if err != nil {
 			return echo.NewHTTPError(http.StatusInternalServerError, fmt.Sprintf("Failed to check list existence: %v", err))
 		}
@@ -418,15 +411,16 @@ func updateTodoInList(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusBadRequest, "Todo title is required")
 	}
 
-	// Önce listenin ve görevin varlığını kontrol et
 	var todoExists int
-	err = db.QueryRow("SELECT IIF(EXISTS(SELECT 1 FROM todos WHERE list_id = @p1 AND id = @p2), 1, 0)", listID, todoID).Scan(&todoExists)
+	// DİKKAT: Tablo adı 'Todos' ve sütun adı 'ListID' olarak düzeltildi
+	err = db.QueryRow("SELECT IIF(EXISTS(SELECT 1 FROM Todos WHERE ListID = @p1 AND ID = @p2), 1, 0)", listID, todoID).Scan(&todoExists)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, fmt.Sprintf("Failed to check todo existence: %v", err))
 	}
 	if todoExists == 0 {
 		var listExists int
-		err = db.QueryRow("SELECT IIF(EXISTS(SELECT 1 FROM todolists WHERE id = @p1), 1, 0)", listID).Scan(&listExists)
+		// DİKKAT: Tablo adı 'TodoLists' olarak düzeltildi
+		err = db.QueryRow("SELECT IIF(EXISTS(SELECT 1 FROM TodoLists WHERE ID = @p1), 1, 0)", listID).Scan(&listExists)
 		if err != nil {
 			return echo.NewHTTPError(http.StatusInternalServerError, fmt.Sprintf("Failed to check list existence: %v", err))
 		}
@@ -441,9 +435,9 @@ func updateTodoInList(c echo.Context) error {
 		completedBit = 1
 	}
 
-	// Veritabanında görevi güncelle
+	// DİKKAT: Tablo adı 'Todos' ve sütun adı 'ListID' olarak düzeltildi
 	res, err := db.Exec(
-		"UPDATE todos SET title = @p1, description = @p2, completed = @p3 WHERE list_id = @p4 AND id = @p5",
+		"UPDATE Todos SET Title = @p1, Description = @p2, Completed = @p3 WHERE ListID = @p4 AND ID = @p5",
 		updatedTodo.Title, updatedTodo.Description, completedBit, listID, todoID,
 	)
 	if err != nil {
@@ -474,13 +468,15 @@ func deleteTodoInList(c echo.Context) error {
 	}
 
 	var todoExists int
-	err = db.QueryRow("SELECT IIF(EXISTS(SELECT 1 FROM todos WHERE list_id = @p1 AND id = @p2), 1, 0)", listID, todoID).Scan(&todoExists)
+	// DİKKAT: Tablo adı 'Todos' ve sütun adı 'ListID' olarak düzeltildi
+	err = db.QueryRow("SELECT IIF(EXISTS(SELECT 1 FROM Todos WHERE ListID = @p1 AND ID = @p2), 1, 0)", listID, todoID).Scan(&todoExists)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, fmt.Sprintf("Failed to check todo existence: %v", err))
 	}
 	if todoExists == 0 {
 		var listExists int
-		err = db.QueryRow("SELECT IIF(EXISTS(SELECT 1 FROM todolists WHERE id = @p1), 1, 0)", listID).Scan(&listExists)
+		// DİKKAT: Tablo adı 'TodoLists' olarak düzeltildi
+		err = db.QueryRow("SELECT IIF(EXISTS(SELECT 1 FROM TodoLists WHERE ID = @p1), 1, 0)", listID).Scan(&listExists)
 		if err != nil {
 			return echo.NewHTTPError(http.StatusInternalServerError, fmt.Sprintf("Failed to check list existence: %v", err))
 		}
@@ -490,7 +486,8 @@ func deleteTodoInList(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusNotFound, "To-Do item not found in this list")
 	}
 
-	res, err := db.Exec("DELETE FROM todos WHERE list_id = @p1 AND id = @p2", listID, todoID)
+	// DİKKAT: Tablo adı 'Todos' ve sütun adı 'ListID' olarak düzeltildi
+	res, err := db.Exec("DELETE FROM Todos WHERE ListID = @p1 AND ID = @p2", listID, todoID)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, fmt.Sprintf("Failed to delete todo: %v", err))
 	}
@@ -504,4 +501,61 @@ func deleteTodoInList(c echo.Context) error {
 	}
 
 	return c.NoContent(http.StatusNoContent)
+}
+
+type SuggestionRequest struct {
+	Title string `json:"title"`
+}
+
+type SuggestionResponse struct {
+	SuggestedDescription string `json:"suggestedDescription"`
+}
+
+func suggestTodoDescription(c echo.Context) error {
+	req := new(SuggestionRequest)
+	if err := c.Bind(req); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "Invalid request body")
+	}
+
+	if req.Title == "" {
+		return echo.NewHTTPError(http.StatusBadRequest, "Todo title is required for suggestion")
+	}
+
+	suggestedDesc, err := generateDescriptionWithOpenAI(req.Title)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, fmt.Sprintf("OpenAI API error: %v", err))
+	}
+
+	return c.JSON(http.StatusOK, SuggestionResponse{SuggestedDescription: suggestedDesc})
+}
+
+func generateDescriptionWithOpenAI(title string) (string, error) {
+	resp, err := openaiClient.CreateChatCompletion(
+		context.Background(),
+		openai.ChatCompletionRequest{
+			Model: openai.GPT3Dot5Turbo,
+			Messages: []openai.ChatCompletionMessage{
+				{
+					Role:    openai.ChatMessageRoleSystem,
+					Content: "You are a helpful assistant that suggests concise and relevant descriptions for to-do list items. Provide only the description, without any introductory phrases.",
+				},
+				{
+					Role:    openai.ChatMessageRoleUser,
+					Content: fmt.Sprintf("Generate a concise description for a to-do item with the title: \"%s\".", title),
+				},
+			},
+			MaxTokens:   50,
+			Temperature: 0.7,
+		},
+	)
+
+	if err != nil {
+		return "", fmt.Errorf("failed to call OpenAI API: %w", err)
+	}
+
+	if len(resp.Choices) == 0 {
+		return "", fmt.Errorf("no suggestion found from OpenAI")
+	}
+
+	return resp.Choices[0].Message.Content, nil
 }
