@@ -13,9 +13,12 @@ RUN go mod download
 # Copy the rest of the application source code
 COPY . .
 
+# .env dosyasını buraya ekleyin
+COPY .env .
+
 # Build the Go application
 # CGO_ENABLED=0 for static linking, GOOS=linux for Linux binary
-RUN CGO_ENABLED=0 GOOS=linux go build -o main .
+RUN CGO_ENABLED=0 GOOS=linux go build -o main ./cmd/api
 
 # Final stage
 FROM alpine:latest
@@ -24,6 +27,7 @@ WORKDIR /app
 
 # Copy the compiled Go application from the builder stage
 COPY --from=builder /app/main .
+COPY --from=builder /app/.env .
 
 
 # Expose the application port

@@ -25,6 +25,8 @@ CREATE TABLE Todos (
     Title NVARCHAR(255) NOT NULL,
     Description NVARCHAR(MAX),
     Completed BIT DEFAULT 0,
+    CreatedAt DATETIME DEFAULT GETDATE(),
+    UpdatedAt DATETIME DEFAULT GETDATE(),
     FOREIGN KEY (ListID) REFERENCES TodoLists(ID) ON DELETE CASCADE
 );
 GO
@@ -78,19 +80,4 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON Todos TO app_user;
 PRINT 'Permissions granted to app_user.';
 GO
 
---PRINT 'Deleting all records from tables...';
---DELETE FROM Todos;
---GO
---DELETE FROM TodoLists;
---GO
-
--- Tabloların IDENTITY (ID sayacı) değerlerini sıfırla
---PRINT 'Resetting IDENTITY values...';
---DBCC CHECKIDENT ('Todos', RESEED, 0);
---GO
---DBCC CHECKIDENT ('TodoLists', RESEED, 0);
---GO
-
---PRINT 'Tables cleaned and IDENTITY values reset successfully.';
---GO
-
+PRINT 'Veritabanı başlatma scripti tamamlandı.';

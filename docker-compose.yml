@@ -27,11 +27,11 @@ services:
       - ./start-sqlserver.sh:/usr/local/bin/start-sqlserver.sh # Özel başlangıç script'ini bağla
     entrypoint: ["bash", "/usr/local/bin/start-sqlserver.sh"] # Özel başlangıç script'ini entrypoint olarak ayarla
     healthcheck: # SQL Server'ın ve veritabanının hazır olup olmadığını kontrol etmek için sağlık kontrolü
-      test: ["CMD", "/opt/mssql-tools/bin/sqlcmd", "-S", "localhost", "-U", "sa", "-P", "${SA_PASSWORD}", "-Q", "SELECT 1"] # SA kullanıcısı ile test et
-      interval: 10s # Her 10 saniyede bir kontrol et
-      timeout: 5s   # Kontrol için maksimum 5 saniye bekle
-      retries: 15   # Başarısız olursa 15 kez tekrar dene
-      start_period: 180s # SQL Server'ın başlaması için ek süre tanı (3 dakika)
+      test: ["CMD", "/opt/mssql-tools/bin/sqlcmd", "-S", "localhost", "-U", "sa", "-P", "${SA_PASSWORD}", "-Q", "SELECT 1;"]
+      interval: 5s # Her 5 saniyede bir kontrol et
+      timeout: 30s # 30 saniye içinde yanıt gelmezse başarısız say
+      retries: 60 # 60 denemeden sonra başarısız say (toplam 5 dakika)
+      start_period: 20s # İlk 20 saniye içinde hataları sayma
 
 volumes:
-  sqlserver_data: # Kalıcı veri depolaması için Docker volume'ü
+  sqlserver_data: # SQL Server verileri için kalıcı bir birim tanımla
