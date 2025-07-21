@@ -1,0 +1,37 @@
+# Docker Compose CLI otomatik olarak en yeni sürümü kullanır.
+
+services:
+  app:
+    build: . # Mevcut dizindeki Dockerfile'ı kullanarak uygulamayı derle
+    ports:
+      - "8080:8080" # Host'un 8080 portunu container'ın 8080 portuna eşle
+    env_file:
+      - .env # Ortam değişkenlerini .env dosyasından yükle
+    depends_on:
+      sqlserver: # Uygulama servisi, sqlserver servisi sağlıklı olana kadar başlasın
+        condition: service_healthy
+
+  sqlserver:
+    build:
+      context: .
+      dockerfile: Dockerfile.sqlserver # Özel SQL Server imajını kullan
+    environment:
+      ACCEPT_EULA: "Y" # EULA'yı kabul et
+      SA_PASSWORD: "${SA_PASSWORD}" # .env dosyasından SA_PASSWORD'u al
+      MSSQL_PID: "Developer" # Geliştirici sürümünü kullan
+    ports:
+      - "1433:1433" # Host'un 1433 portunu container'ın 1433 portuna eşle
+    volumes:
+      - sqlserver_data:/var/opt/mssql/data # Veritabanı verilerini kalıcı hale getir
+      - ./init.sql:/usr/src/app/init/init.sql # init.sql dosyasını container'a bağla
+      - ./start-sqlserver.sh:/usr/local/bin/start-sqlserver.sh # Özel başlangıç script'ini bağla
+    entrypoint: ["bash", "/usr/local/bin/start-sqlserver.sh"] # Özel başlangıç script'ini entrypoint olarak ayarla
+    healthcheck: # SQL Server'ın ve veritabanının hazır olup olmadığını kontrol etmek için sağlık kontrolü
+      test: ["CMD", "/opt/mssql-tools/bin/sqlcmd", "-S", "localhost", "-U", "sa", "-P", "${SA_PASSWORD}", "-Q", "SELECT 1"] # SA kullanıcısı ile test et
+      interval: 10s # Her 10 saniyede bir kontrol et
+      timeout: 5s   # Kontrol için maksimum 5 saniye bekle
+      retries: 15   # Başarısız olursa 15 kez tekrar dene
+      start_period: 180s # SQL Server'ın başlaması için ek süre tanı (3 dakika)
+
+volumes:
+  sqlserver_data: # Kalıcı veri depolaması için Docker volume'ü

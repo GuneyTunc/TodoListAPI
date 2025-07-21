@@ -1,0 +1,31 @@
+# SQL Server'ın resmi imajını temel al
+FROM mcr.microsoft.com/mssql/server:2019-latest
+
+# Geçici olarak root kullanıcıya geç
+USER root
+
+# APT paket listelerini güncelle
+RUN apt-get update
+
+# Temel araçları (curl, gnupg, apt-transport-https, netcat-traditional, procps, util-linux) yükle
+# procps paketi, pgrep komutunu sağlar. util-linux paketi, su komutunu sağlar.
+RUN apt-get install -y curl gnupg apt-transport-https netcat-traditional procps util-linux
+
+# Microsoft SQL Server için GPG anahtarını ve depo yapılandırmasını ekle
+RUN curl https://packages.microsoft.com/keys/microsoft.asc | apt-key add - && \
+    curl https://packages.microsoft.com/config/ubuntu/20.04/prod.list > /etc/apt/sources.list.d/mssql-release.list
+
+# Yeni depoyu tanıması için APT paket listelerini tekrar güncelle
+RUN apt-get update
+
+# mssql-tools ve unixodbc-dev paketlerini yükle
+RUN ACCEPT_EULA=Y apt-get install -y mssql-tools unixodbc-dev
+
+# APT önbelleğini temizle (imaj boyutunu optimize etmek için)
+RUN rm -rf /var/lib/apt/lists/*
+
+# sqlcmd'nin PATH'e eklendiğinden emin ol
+ENV PATH="/opt/mssql-tools/bin:${PATH}"
+
+# Not: USER mssql burada kaldırıldı. start-sqlserver.sh script'i root olarak başlayacak
+# ve gerekli izinleri ayarladıktan sonra mssql kullanıcısına geçecektir.
